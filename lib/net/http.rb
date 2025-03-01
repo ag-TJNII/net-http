@@ -1187,13 +1187,16 @@ module Net   #:nodoc:
       @proxy_user     = nil
       @proxy_pass     = nil
       @proxy_use_ssl  = nil
+      @proxy_ssl_context = nil
+      @proxy_ssl_session = nil
 
       @use_ssl = false
       @ssl_context = nil
       @ssl_session = nil
       @sspi_enabled = false
-      SSL_IVNAMES.each do |ivname|
-        instance_variable_set ivname, nil
+      SSL_ATTRIBUTES.each do |ivname|
+        instance_variable_set "@#{ivname}".to_sym, nil
+        instance_variable_set "@proxy_#{ivname}".to_sym, nil
       end
     end
 
@@ -1529,8 +1532,6 @@ module Net   #:nodoc:
       :verify_hostname,
     ] # :nodoc:
 
-    SSL_IVNAMES = SSL_ATTRIBUTES.map { |a| "@#{a}".to_sym } # :nodoc:
-
     # Sets or returns the path to a CA certification file in PEM format.
     attr_accessor :ca_file
 
@@ -1638,12 +1639,41 @@ module Net   #:nodoc:
     end
     private :do_start
 
+    def build_ssl_context(ivname_prefix: "")
+      target_context = OpenSSL::SSL::SSLContext.new
+
+      ssl_parameters = Hash.new
+      iv_list = instance_variables
+      SSL_ATTRIBUTES.map { |ivname| "@#{ivname_prefix}#{ivname}".to_sym }.each_with_index do |ivname, i|
+        if iv_list.include?(ivname)
+          value = instance_variable_get(ivname)
+          unless value.nil?
+            ssl_parameters[SSL_ATTRIBUTES[i]] = value
+          end
+        end
+      end
+      target_context.set_params(ssl_parameters)
+      unless target_context.session_cache_mode.nil? # a dummy method on JRuby
+        target_context.session_cache_mode =
+          OpenSSL::SSL::SSLContext::SESSION_CACHE_CLIENT |
+          OpenSSL::SSL::SSLContext::SESSION_CACHE_NO_INTERNAL_STORE
+      end
+      if target_context.respond_to?(:session_new_cb) # not implemented under JRuby
+        target_context.session_new_cb = proc {|sock, sess| @ssl_session = sess }
+      end
+
+      return target_context
+    end
+    private :build_ssl_context
+    
     def connect
       if use_ssl?
         # reference early to load OpenSSL before connecting,
         # as OpenSSL may take time to load.
-        @ssl_context = OpenSSL::SSL::SSLContext.new
+        @ssl_context = build_ssl_context
       end
+
+      @proxy_ssl_context = build_ssl_context(ivname_prefix: "proxy_") if proxy_use_ssl?
 
       if proxy? then
         conn_addr = proxy_address
@@ -1667,7 +1697,7 @@ module Net   #:nodoc:
       if use_ssl?
         if proxy?
           if @proxy_use_ssl
-            proxy_sock = OpenSSL::SSL::SSLSocket.new(s)
+            proxy_sock = OpenSSL::SSL::SSLSocket.new(s, @proxy_ssl_context)
             ssl_socket_connect(proxy_sock, @open_timeout)
           else
             proxy_sock = s
@@ -1686,26 +1716,6 @@ module Net   #:nodoc:
           proxy_sock.write(buf)
           HTTPResponse.read_new(proxy_sock).value
           # assuming nothing left in buffers after successful CONNECT response
-        end
-
-        ssl_parameters = Hash.new
-        iv_list = instance_variables
-        SSL_IVNAMES.each_with_index do |ivname, i|
-          if iv_list.include?(ivname)
-            value = instance_variable_get(ivname)
-            unless value.nil?
-              ssl_parameters[SSL_ATTRIBUTES[i]] = value
-            end
-          end
-        end
-        @ssl_context.set_params(ssl_parameters)
-        unless @ssl_context.session_cache_mode.nil? # a dummy method on JRuby
-          @ssl_context.session_cache_mode =
-              OpenSSL::SSL::SSLContext::SESSION_CACHE_CLIENT |
-                  OpenSSL::SSL::SSLContext::SESSION_CACHE_NO_INTERNAL_STORE
-        end
-        if @ssl_context.respond_to?(:session_new_cb) # not implemented under JRuby
-          @ssl_context.session_new_cb = proc {|sock, sess| @ssl_session = sess }
         end
 
         # Still do the post_connection_check below even if connecting
@@ -1867,6 +1877,26 @@ module Net   #:nodoc:
         "http", nil, address, port, nil, nil, nil, nil, nil
       ).find_proxy || false
       @proxy_uri || nil
+    end
+
+    # Returns +true+ if +self+ uses SSL, +false+ otherwise.
+    # See Net::HTTP#proxy_use_ssl=.
+    def proxy_use_ssl?
+      @proxy_use_ssl
+    end
+
+    # Sets whether a new session is to use
+    # {Transport Layer Security}[https://en.wikipedia.org/wiki/Transport_Layer_Security]:
+    #
+    # Raises IOError if attempting to change during a session.
+    #
+    # Raises OpenSSL::SSL::SSLError if the port is not an HTTPS port.
+    def proxy_use_ssl=(flag)
+      flag = flag ? true : false
+      if started? and @proxy_use_ssl != flag
+        raise IOError, "proxy_use_ssl value changed, but session already started"
+      end
+      @proxy_use_ssl = flag
     end
 
     # Returns the address of the proxy server, if defined, +nil+ otherwise;
